@@ -21,7 +21,7 @@ RUN_AS="node:node"
 III_CONFIG="/opt/agentmemory/node_modules/@agentmemory/agentmemory/dist/iii-config.yaml"
 
 mkdir -p "$DATA_DIR"
-chown -R "$RUN_AS" "$DATA_DIR"
+find "$DATA_DIR" -path "$DATA_DIR/spend-guard" -prune -o -exec chown "$RUN_AS" {} +
 
 cat > "$III_CONFIG" <<'EOF'
 workers:
@@ -95,4 +95,4 @@ fi
 AGENTMEMORY_SECRET="$(cat "$HMAC_FILE")"
 export AGENTMEMORY_SECRET
 
-exec gosu "$RUN_AS" agentmemory "$@"
+exec node --experimental-strip-types /opt/spend-guard/spend-guard.ts "$@"
