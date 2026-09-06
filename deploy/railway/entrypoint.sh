@@ -22,6 +22,10 @@ III_CONFIG="/opt/agentmemory/node_modules/@agentmemory/agentmemory/dist/iii-conf
 
 mkdir -p "$DATA_DIR"
 find "$DATA_DIR" -path "$DATA_DIR/spend-guard" -prune -o -exec chown "$RUN_AS" {} +
+# The sticky, root-owned parent prevents node from renaming/removing the ledger
+# while the node group can still create AgentMemory's own persistent files.
+chown root:node "$DATA_DIR"
+chmod 1770 "$DATA_DIR"
 
 cat > "$III_CONFIG" <<'EOF'
 workers:
