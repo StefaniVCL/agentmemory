@@ -6,7 +6,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-export const LIMIT_MICRO_USD = 30_000_000;
+export const LIMIT_MICRO_USD = 40_000_000;
 export const WINDOW_MS = 35 * 24 * 60 * 60 * 1000;
 export const PRICE_REVIEW_UNTIL = Date.parse("2027-01-01T00:00:00Z");
 // Reviewed 2026-10-09 on developers.openai.com: gpt-4o-mini $0.15 in / $0.60 out and
