@@ -236,9 +236,9 @@ export function childEnvironment(source: NodeJS.ProcessEnv, localToken: string):
     OPENAI_API_KEY: localToken, OPENAI_BASE_URL: "http://127.0.0.1:3114",
     OPENAI_EMBEDDING_BASE_URL: "http://127.0.0.1:3114", OPENAI_MODEL: "gpt-4o-mini",
     OPENAI_EMBEDDING_MODEL: "text-embedding-3-small", EMBEDDING_PROVIDER: "openai",
-    // Every call reserves MAX_TOKENS of output, so this, not real usage, sizes per-observation
-    // compression against the cap; summaries stay well under 1,500 tokens.
-    MAX_TOKENS: "1500", AGENTMEMORY_AUTO_COMPRESS: "true", AGENTMEMORY_ALLOW_AGENT_SDK: "false",
+    // With AUTO_COMPRESS on, 0.9.27 indexes an observation for search only after its LLM
+    // compression succeeds; a refused or failed call leaves it stored raw but unsearchable.
+    MAX_TOKENS: "4096", AGENTMEMORY_AUTO_COMPRESS: "false", AGENTMEMORY_ALLOW_AGENT_SDK: "false",
     AGENTMEMORY_IMAGE_EMBEDDINGS: "false", CONSOLIDATION_ENABLED: source.CONSOLIDATION_ENABLED === "false" ? "false" : "true",
     // ~100 rendered observations (≤ ~600 B each) keep a summary chunk under the 100 KB body cap.
     SUMMARIZE_CHUNK_SIZE: "100",

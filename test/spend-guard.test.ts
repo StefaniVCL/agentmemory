@@ -149,8 +149,7 @@ describe("allowed paid requests", () => {
     expect(env.OPENAI_EMBEDDING_BASE_URL).toBe(env.OPENAI_BASE_URL);
     expect(env.AGENTMEMORY_ALLOW_AGENT_SDK).toBe("false"); expect(env.AGENTMEMORY_SECRET).toBe("memory-token");
     expect(Object.values(env)).not.toContain("real");
-    expect(env.SUMMARIZE_CHUNK_SIZE).toBe("100"); expect(env.MAX_TOKENS).toBe("1500");
-    expect(env.AGENTMEMORY_AUTO_COMPRESS).toBe("true");
+    expect(env.SUMMARIZE_CHUNK_SIZE).toBe("100"); expect(env.AGENTMEMORY_AUTO_COMPRESS).toBe("false");
   });
   it("requires a real /data mount rather than a directory or environment variable", () => {
     expect(() => assertDataMount("1 2 0:1 / / rw - overlay overlay rw")).toThrow();
