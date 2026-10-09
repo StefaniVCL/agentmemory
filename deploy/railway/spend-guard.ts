@@ -8,7 +8,10 @@ import { fileURLToPath } from "node:url";
 
 export const LIMIT_MICRO_USD = 30_000_000;
 export const WINDOW_MS = 35 * 24 * 60 * 60 * 1000;
-export const PRICE_REVIEW_UNTIL = Date.parse("2026-10-01T00:00:00Z");
+export const PRICE_REVIEW_UNTIL = Date.parse("2027-01-01T00:00:00Z");
+// Reviewed 2026-10-09 on developers.openai.com: gpt-4o-mini $0.15 in / $0.60 out and
+// text-embedding-3-small $0.02, per million tokens (so micro-USD per token).
+export const MICRO_USD_PER_TOKEN = { chatInput: 0.15, chatOutput: 0.6, embedding: 0.02 } as const;
 const LEDGER = "/data/spend-guard/reservations.sqlite";
 const MAX_BODY_BYTES = 100_000;
 const MAX_RESPONSE_BYTES = 8_000_000;
@@ -68,9 +71,9 @@ export class ReservationLedger {
       throw new GuardError("spend_ledger_replaced");
     }
   }
-  reserve(kind: "chat" | "embedding") {
+  reserve(kind: "chat" | "embedding", cost: number) {
     this.assertIdentity();
-    const cost = kind === "chat" ? 30_000 : 10_000;
+    if (!Number.isSafeInteger(cost) || cost <= 0) throw new GuardError("invalid_reservation");
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const now = this.clock();
@@ -85,8 +88,27 @@ export class ReservationLedger {
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
+  reservedInWindow() {
+    const sum = this.db.prepare("SELECT COALESCE(SUM(micro_usd),0) AS total FROM reservations WHERE created_at>=?").get(this.clock() - WINDOW_MS)!;
+    return Number(sum.total);
+  }
   freeze() { this.db.exec("UPDATE control SET frozen=1 WHERE id=1"); }
   close() { this.db.close(); }
+}
+
+// Strict upper bound for one request: every token is at least one UTF-8 byte, so the forwarded
+// body's byte length bounds the input tokens, and max_tokens bounds chat output.
+export function reservationMicroUsd(request: ReturnType<typeof validateRequest>) {
+  const bytes = Buffer.byteLength(JSON.stringify(request.body), "utf8");
+  if (request.kind === "chat") {
+    return Math.ceil(bytes * MICRO_USD_PER_TOKEN.chatInput + Number(request.body.max_tokens) * MICRO_USD_PER_TOKEN.chatOutput);
+  }
+  return Math.ceil(bytes * MICRO_USD_PER_TOKEN.embedding);
+}
+function usedMicroUsd(kind: "chat" | "embedding", usage: { prompt_tokens: number; completion_tokens?: number }) {
+  return kind === "chat"
+    ? usage.prompt_tokens * MICRO_USD_PER_TOKEN.chatInput + Number(usage.completion_tokens) * MICRO_USD_PER_TOKEN.chatOutput
+    : usage.prompt_tokens * MICRO_USD_PER_TOKEN.embedding;
 }
 
 function object(value: unknown): Record<string, unknown> {
@@ -175,7 +197,8 @@ export function createGateway(options: {
       const request = validateRequest(req.url!, await readBounded(req, MAX_BODY_BYTES));
       if (!options.upstreamKey) throw new GuardError("upstream_key_not_configured");
       if (inFlight >= 4) throw new GuardError("spend_guard_busy", 429);
-      options.ledger.reserve(request.kind);
+      const reserved = reservationMicroUsd(request);
+      options.ledger.reserve(request.kind, reserved);
       inFlight++; admitted = true;
       const response = await (options.fetchImpl || fetch)(`${options.upstream || UPSTREAM}${req.url}`, {
         method: "POST", redirect: "error", signal: AbortSignal.timeout(options.timeoutMs || 60_000),
@@ -191,7 +214,8 @@ export function createGateway(options: {
       const result = JSON.parse((await readBounded(response.body, MAX_RESPONSE_BYTES)).toString("utf8"));
       const usage = result.usage;
       if (!usage || !Number.isSafeInteger(usage.prompt_tokens) || usage.prompt_tokens < 0 || usage.prompt_tokens > 128_000 ||
-          (request.kind === "chat" && (!Number.isSafeInteger(usage.completion_tokens) || usage.completion_tokens < 0 || usage.completion_tokens > 4096))) {
+          (request.kind === "chat" && (!Number.isSafeInteger(usage.completion_tokens) || usage.completion_tokens < 0 || usage.completion_tokens > 4096)) ||
+          usedMicroUsd(request.kind, usage) > reserved) {
         options.ledger.freeze();
         throw new GuardError("unexpected_upstream_usage", 502);
       }
@@ -212,8 +236,12 @@ export function childEnvironment(source: NodeJS.ProcessEnv, localToken: string):
     OPENAI_API_KEY: localToken, OPENAI_BASE_URL: "http://127.0.0.1:3114",
     OPENAI_EMBEDDING_BASE_URL: "http://127.0.0.1:3114", OPENAI_MODEL: "gpt-4o-mini",
     OPENAI_EMBEDDING_MODEL: "text-embedding-3-small", EMBEDDING_PROVIDER: "openai",
-    MAX_TOKENS: "4096", AGENTMEMORY_AUTO_COMPRESS: "false", AGENTMEMORY_ALLOW_AGENT_SDK: "false",
+    // Every call reserves MAX_TOKENS of output, so this, not real usage, sizes per-observation
+    // compression against the cap; summaries stay well under 1,500 tokens.
+    MAX_TOKENS: "1500", AGENTMEMORY_AUTO_COMPRESS: "true", AGENTMEMORY_ALLOW_AGENT_SDK: "false",
     AGENTMEMORY_IMAGE_EMBEDDINGS: "false", CONSOLIDATION_ENABLED: source.CONSOLIDATION_ENABLED === "false" ? "false" : "true",
+    // ~100 rendered observations (≤ ~600 B each) keep a summary chunk under the 100 KB body cap.
+    SUMMARIZE_CHUNK_SIZE: "100",
   };
 }
 export function assertDataMount(mountInfo: string) {
@@ -262,7 +290,8 @@ async function main() {
   child.once("exit", code => shutdown(code === 0 ? 0 : 1));
   process.once("SIGTERM", () => shutdown(0));
   process.once("SIGINT", () => shutdown(0));
-  console.log("Spending guard active: USD30 conservative reservations / rolling35days; price review required by 2026-10-01 UTC.");
+  console.log(`Spending guard active: USD${(ledger.reservedInWindow() / 1e6).toFixed(2)} of USD${LIMIT_MICRO_USD / 1e6} reserved in the rolling 35 days; ` +
+    `price review required by ${new Date(PRICE_REVIEW_UNTIL).toISOString().slice(0, 10)} UTC.`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

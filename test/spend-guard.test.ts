@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join, dirname, resolve, basename } from "node:path";
 import { createServer, type Server } from "node:http";
 import { DatabaseSync } from "node:sqlite";
-import { ReservationLedger, createGateway, validateRequest, childEnvironment, assertDataMount,
-  LIMIT_MICRO_USD, WINDOW_MS, PRICE_REVIEW_UNTIL } from "../deploy/railway/spend-guard.ts";
+import { ReservationLedger, createGateway, validateRequest, childEnvironment, assertDataMount, reservationMicroUsd,
+  LIMIT_MICRO_USD, WINDOW_MS, PRICE_REVIEW_UNTIL, MICRO_USD_PER_TOKEN } from "../deploy/railway/spend-guard.ts";
 
 const NOW = Date.parse("2026-09-06T00:00:00Z");
 const folders: string[] = [];
@@ -27,6 +27,8 @@ function fill(instance: ReservationLedger, amount: number, when = NOW) {
 const chat = { model: "gpt-4o-mini", messages: [{ role: "user", content: "test" }], max_tokens: 4096, stream: false };
 const embed = { model: "text-embedding-3-small", input: ["test"] };
 function validate(path: string, body: unknown) { return validateRequest(path, Buffer.from(JSON.stringify(body))); }
+const CHAT = reservationMicroUsd(validate("/v1/chat/completions", chat));
+const EMBED = reservationMicroUsd(validate("/v1/embeddings", embed));
 async function listen(server: Server) {
   servers.push(server);
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -51,33 +53,33 @@ afterEach(async () => {
 });
 
 describe("persistent spending reservations", () => {
-  it("reserves the entire worst-case charge before forwarding", () => {
-    const item = ledger(); item.reserve("chat"); item.reserve("embedding");
+  it("records each reservation in full", () => {
+    const item = ledger(); item.reserve("chat", 30_000); item.reserve("embedding", 10_000);
     expect(charged(item)).toBe(40_000);
   });
   it("stops exactly at the conservative cap and survives reopening", () => {
-    const item = ledger(); fill(item, LIMIT_MICRO_USD - 30_000); item.reserve("chat");
-    expect(() => item.reserve("embedding")).toThrow("spend_limit_reached");
+    const item = ledger(); fill(item, LIMIT_MICRO_USD - 30_000); item.reserve("chat", 30_000);
+    expect(() => item.reserve("embedding", 1)).toThrow("spend_limit_reached");
     const reopened = new ReservationLedger(item.path, () => NOW); ledgers.push(reopened);
-    expect(() => reopened.reserve("chat")).toThrow("spend_limit_reached");
+    expect(() => reopened.reserve("chat", 1)).toThrow("spend_limit_reached");
   });
   it("uses one durable cap across independent connections", () => {
     const first = ledger(); fill(first, LIMIT_MICRO_USD - 30_000);
     const second = new ReservationLedger(first.path, () => NOW); ledgers.push(second);
-    first.reserve("chat"); expect(() => second.reserve("chat")).toThrow("spend_limit_reached");
+    first.reserve("chat", 30_000); expect(() => second.reserve("chat", 1)).toThrow("spend_limit_reached");
   });
   it("retains previous-month reservations and only expires after 35 days", () => {
     const item = ledger(); fill(item, LIMIT_MICRO_USD, NOW - 7 * 86400_000);
-    expect(() => item.reserve("embedding")).toThrow("spend_limit_reached");
+    expect(() => item.reserve("embedding", 1)).toThrow("spend_limit_reached");
     item.db.prepare("UPDATE reservations SET created_at=?").run(NOW - WINDOW_MS - 1);
-    item.reserve("embedding");
+    item.reserve("embedding", 10_000);
     expect(charged(item)).toBe(LIMIT_MICRO_USD + 10_000);
   });
   it("rejects clock rollback and expired price approval", () => {
     const item = ledger(); item.clock = () => NOW - 1;
-    expect(() => item.reserve("chat")).toThrow("spend_clock_rollback");
+    expect(() => item.reserve("chat", 30_000)).toThrow("spend_clock_rollback");
     item.clock = () => PRICE_REVIEW_UNTIL;
-    expect(() => item.reserve("chat")).toThrow("spend_price_review_required");
+    expect(() => item.reserve("chat", 30_000)).toThrow("spend_price_review_required");
     expect(charged(item)).toBe(0);
   });
   it("will not reset an existing or damaged ledger", () => {
@@ -92,12 +94,30 @@ describe("persistent spending reservations", () => {
     if (process.platform === "win32") item.db.close();
     renameSync(item.path, moved); writeFileSync(item.path, readFileSync(moved));
     if (process.platform === "win32") item.db = new DatabaseSync(item.path);
-    expect(() => item.reserve("chat")).toThrow("spend_ledger_replaced");
+    expect(() => item.reserve("chat", 30_000)).toThrow("spend_ledger_replaced");
+  });
+  it("refuses empty or fractional reservations", () => {
+    const item = ledger();
+    expect(() => item.reserve("chat", 0)).toThrow("invalid_reservation");
+    expect(() => item.reserve("embedding", 1.5)).toThrow("invalid_reservation");
+    expect(charged(item)).toBe(0);
   });
 });
 function dirnameFor(path: string) { return join(path, ".."); }
 
 describe("allowed paid requests", () => {
+  it("bounds each reservation by the forwarded bytes and the output limit", () => {
+    const request = validate("/v1/chat/completions", chat);
+    const bytes = Buffer.byteLength(JSON.stringify(request.body));
+    expect(CHAT).toBe(Math.ceil(bytes * MICRO_USD_PER_TOKEN.chatInput + 4096 * MICRO_USD_PER_TOKEN.chatOutput));
+    expect(EMBED).toBe(Math.ceil(Buffer.byteLength(JSON.stringify(validate("/v1/embeddings", embed).body)) * MICRO_USD_PER_TOKEN.embedding));
+  });
+  it("never reserves more than the previous flat worst case for the largest allowed bodies", () => {
+    const bigChat = { ...chat, messages: [{ role: "user", content: "a".repeat(99_800) }] };
+    const bigEmbed = { ...embed, input: Array.from({ length: 12 }, () => "a".repeat(8000)) };
+    expect(reservationMicroUsd(validate("/v1/chat/completions", bigChat))).toBeLessThan(30_000);
+    expect(reservationMicroUsd(validate("/v1/embeddings", bigEmbed))).toBeLessThan(10_000);
+  });
   it("rebuilds text-only requests and forces standard tier", () => {
     expect(validate("/v1/chat/completions", chat).body).toMatchObject({ n: 1, stream: false, service_tier: "default" });
     expect(validate("/v1/embeddings", embed).kind).toBe("embedding");
@@ -129,6 +149,8 @@ describe("allowed paid requests", () => {
     expect(env.OPENAI_EMBEDDING_BASE_URL).toBe(env.OPENAI_BASE_URL);
     expect(env.AGENTMEMORY_ALLOW_AGENT_SDK).toBe("false"); expect(env.AGENTMEMORY_SECRET).toBe("memory-token");
     expect(Object.values(env)).not.toContain("real");
+    expect(env.SUMMARIZE_CHUNK_SIZE).toBe("100"); expect(env.MAX_TOKENS).toBe("1500");
+    expect(env.AGENTMEMORY_AUTO_COMPRESS).toBe("true");
   });
   it("requires a real /data mount rather than a directory or environment variable", () => {
     expect(() => assertDataMount("1 2 0:1 / / rw - overlay overlay rw")).toThrow();
@@ -138,7 +160,7 @@ describe("allowed paid requests", () => {
 
 describe("fake-upstream integration", () => {
   it("forwards no more requests than reserved under concurrent load", async () => {
-    const item = ledger(); fill(item, LIMIT_MICRO_USD - 30_000); let calls = 0;
+    const item = ledger(); fill(item, LIMIT_MICRO_USD - CHAT); let calls = 0;
     const url = await listen(gateway(item, (async () => {
       calls++; await new Promise(resolve => setTimeout(resolve, 20));
       return Response.json({ usage: { prompt_tokens: 10, completion_tokens: 2 }, choices: [] });
@@ -156,7 +178,7 @@ describe("fake-upstream integration", () => {
       const response = await post(url);
       expect(response.status).toBe(503); expect(await response.text()).not.toContain("private-upstream-key");
     }
-    expect(calls).toBe(3); expect(charged(item)).toBe(90_000);
+    expect(calls).toBe(3); expect(charged(item)).toBe(3 * CHAT);
   });
   it("does not forward unauthorized or unapproved requests", async () => {
     const item = ledger(); let calls = 0;
@@ -173,14 +195,23 @@ describe("fake-upstream integration", () => {
     }) as typeof fetch));
     expect((await post(url, "/v1/embeddings", embed)).status).toBe(502);
     expect((await post(url, "/v1/embeddings", embed)).status).toBe(503);
-    expect(calls).toBe(1); expect(charged(item)).toBe(10_000);
+    expect(calls).toBe(1); expect(charged(item)).toBe(EMBED);
+  });
+  it("freezes when reported usage costs more than was reserved", async () => {
+    const item = ledger(); let calls = 0;
+    const url = await listen(gateway(item, (async () => {
+      calls++; return Response.json({ usage: { prompt_tokens: 1000 }, data: [] });
+    }) as typeof fetch));
+    expect((await post(url, "/v1/embeddings", embed)).status).toBe(502);
+    expect((await post(url, "/v1/embeddings", embed)).status).toBe(503);
+    expect(calls).toBe(1); expect(charged(item)).toBe(EMBED);
   });
   it("refuses redirects on a real local HTTP upstream and retains reservation", async () => {
     let destinationCalls = 0;
     const destination = await listen(createServer((_req, res) => { destinationCalls++; res.end("unexpected"); }));
     const upstream = await listen(createServer((_req, res) => { res.writeHead(307, { Location: destination }); res.end(); }));
     const item = ledger(); const url = await listen(createGateway({ ledger: item, upstreamKey: "fake", localToken: "local-only-token", upstream }));
-    expect((await post(url)).status).toBe(503); expect(destinationCalls).toBe(0); expect(charged(item)).toBe(30_000);
+    expect((await post(url)).status).toBe(503); expect(destinationCalls).toBe(0); expect(charged(item)).toBe(CHAT);
   });
   it("exchanges a successful embedding through an actual fake HTTP provider", async () => {
     let seenKey = "";
@@ -192,12 +223,12 @@ describe("fake-upstream integration", () => {
     }));
     const item = ledger(); const url = await listen(createGateway({ ledger: item, upstreamKey: "fake", localToken: "local-only-token", upstream }));
     const result = await post(url, "/v1/embeddings", embed);
-    expect(result.status).toBe(200); expect(seenKey).toBe("Bearer fake"); expect(charged(item)).toBe(10_000);
+    expect(result.status).toBe(200); expect(seenKey).toBe("Bearer fake"); expect(charged(item)).toBe(EMBED);
   });
   it("keeps the reservation when an upstream times out", async () => {
     const upstream = await listen(createServer((_req, _res) => {}));
     const item = ledger();
     const url = await listen(createGateway({ ledger: item, upstreamKey: "fake", localToken: "local-only-token", upstream, timeoutMs: 20 }));
-    expect((await post(url)).status).toBe(503); expect(charged(item)).toBe(30_000);
+    expect((await post(url)).status).toBe(503); expect(charged(item)).toBe(CHAT);
   });
 });
